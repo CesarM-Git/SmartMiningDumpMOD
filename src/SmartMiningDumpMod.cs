@@ -15,6 +15,7 @@ using Mafi.Core.Mods;
 using Mafi.Core.Products;
 using Mafi.Core.Prototypes;
 using Mafi.Core.Simulation;
+using Mafi.Core.Vehicles.Jobs;
 using Mafi.Core.Vehicles.Trucks;
 using Mafi.Core.Vehicles.Trucks.JobProviders;
 using Mafi.Localization;
@@ -28,14 +29,22 @@ namespace SmartMiningDumpMod;
 
 /// <summary>
 /// Mod that adds a "Prefer Dumping" toggle to mining towers. When enabled, trucks
-/// assigned to that tower will attempt to dump materials marked as dumpable in
-/// dumping/leveling designations within the tower's zone BEFORE falling back to
-/// storage delivery.
+/// assigned to that tower will dump materials at the tower's dumping designations
+/// INSTEAD of delivering to assigned export storages.
 ///
-/// Mechanism: subscribes to ISimLoopEvents.UpdateStart which fires before each sim
-/// step's Update(). When a truck finishes loading (has cargo, no pending jobs), our
-/// handler runs before the truck's SimUpdateInternal can call TryGetJobFor, giving
-/// us a one-tick window to pre-assign a dump job.
+/// Mechanism: wraps each assigned truck's m_jobProvider with a DumpFirstWrapper
+/// that intercepts TryGetJobFor. The wrapper checks the toggle preference and, if
+/// ON and the truck's cargo is in the tower's DumpableProducts, calls the dump-job
+/// factory directly. On success, the wrapper short-circuits vanilla logic — the
+/// storage-export priority in MineTowerTruckJobProvider.tryGetExcavatorDeliveryJob
+/// (which puts AssignedInputStorages above the local-dump path) never runs.
+/// On failure (dump factory rejects), the wrapper falls through to the vanilla
+/// provider so trucks don't get stuck.
+///
+/// The wrapper is swapped out of m_jobProvider before every save (BeforeSave) and
+/// swapped back in (UpdateAfterSync), so save files never contain our custom type
+/// and remain loadable without the mod. A reconcile pass on UpdateStart handles
+/// truck reassignments and despawns.
 /// </summary>
 public sealed class SmartMiningDumpMod : IMod, IDisposable
 {
@@ -71,6 +80,29 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
 
     // ── Sim event delegates (stored for unsubscribe) ────────────────────
     private Action m_updateStartAction;
+    private Action m_beforeSaveAction;
+    private Action m_updateAfterSyncAction;
+
+    // ── Singleton accessor (used by the inspector toggle callback to call
+    //    wrap/unwrap when the user flips a tower's preference) ────────────
+    public static SmartMiningDumpMod Instance { get; private set; }
+
+    // ── Provider-wrapper bookkeeping ────────────────────────────────────
+    // Tracks every truck whose m_jobProvider we've swapped to a DumpFirstWrapper.
+    // Key: truck.Id.Value. Value: the wrapper currently installed (which holds a
+    // reference to the original vanilla MineTowerTruckJobProvider for swap-back).
+    //
+    // Two reasons we need this:
+    //  1. Save-safety: BeforeSave unwraps every entry (swaps back to vanilla
+    //     provider) so the save file never contains our custom type. The wrapper
+    //     would otherwise be serialized by Option<IJobProvider<Truck>>.Serialize
+    //     → WriteGeneric, which writes the runtime type name, making the save
+    //     un-loadable without our mod (or fragile to deserialize even with it).
+    //  2. Truck reassignment: when MineTower.UnassignVehicle fires it calls
+    //     truck.ResetJobProvider(), wiping our wrapper. The periodic reconcile
+    //     pass uses this map to detect stale entries and re-wrap as needed.
+    private readonly Dictionary<int, DumpFirstWrapper> m_activeWrappers
+        = new Dictionary<int, DumpFirstWrapper>();
 
     // ── Diagnostics ─────────────────────────────────────────────────────
     // Towers we've logged a summary for at least once this session. Prevents
@@ -91,6 +123,7 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
     {
         Manifest = manifest;
         JsonConfig = new ModJsonConfig(this);
+        Instance = this;
     }
 
     public void RegisterPrototypes(ProtoRegistrator registrator) { }
@@ -258,9 +291,22 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
 
     private void SubscribeSimEvents()
     {
+        // UpdateStart: periodic reconcile (wrap toggled-tower trucks, unwrap stale).
         m_updateStartAction = OnUpdateStart;
         m_simLoopEvents.UpdateStart.AddNonSaveable(this, m_updateStartAction);
-        Log.Info("SmartMiningDumpMOD: Subscribed to UpdateStart.");
+
+        // BeforeSave: swap every wrapper back to its inner vanilla provider so the
+        // save file only contains types that exist in vanilla Mafi. Critical for
+        // save compatibility — both mod-uninstall and cross-version load.
+        m_beforeSaveAction = OnBeforeSave;
+        m_simLoopEvents.BeforeSave.AddNonSaveable(this, m_beforeSaveAction);
+
+        // UpdateAfterSync: just after the save finishes (sync phase ends),
+        // re-wrap toggled-tower trucks so the dump-first behavior resumes.
+        m_updateAfterSyncAction = OnUpdateAfterSync;
+        m_simLoopEvents.UpdateAfterSync.AddNonSaveable(this, m_updateAfterSyncAction);
+
+        Log.Info("SmartMiningDumpMOD: Subscribed to UpdateStart, BeforeSave, UpdateAfterSync.");
     }
 
     // ── Cached reflection for dump job invocation (resolved once) ──────
@@ -297,16 +343,16 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
     }
 
     /// <summary>
-    /// Fires before each sim step's Update(). Trucks that finished loading in the
-    /// previous step now have cargo but no job — their SimUpdateInternal hasn't run yet.
-    /// We pre-assign dump jobs for trucks on toggled towers.
+    /// Fires before each sim step. Used to reconcile our provider-wrappers against
+    /// the actual tower↔truck assignments (handles trucks that get reassigned
+    /// between towers, towers that change toggle state, despawned trucks, etc.).
     /// </summary>
     private void OnUpdateStart()
     {
         if (DumpPreferenceManager.Instance == null) return;
-        if (DumpPreferenceManager.Instance.ToggledCount == 0) return;
 
-        // Lazy-resolve factory if we didn't have towers at init time
+        // Lazy-resolve factory if we didn't have towers at init time. Without
+        // the factory we can't construct any wrappers, so we skip until we can.
         if (m_dumpJobFactory == null)
         {
             var anyTower = m_entitiesManager.GetAllEntitiesOfType<MineTower>().FirstOrDefault();
@@ -315,52 +361,275 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
             CacheReflectionForHotPath();
         }
 
+        ReconcileWrappers();
+    }
+
+    /// <summary>
+    /// Hooked to <see cref="ISimLoopEvents.BeforeSave"/>. Swaps every wrapped truck's
+    /// provider back to its inner vanilla <see cref="MineTowerTruckJobProvider"/>
+    /// so the save file's <c>Option&lt;IJobProvider&lt;Truck&gt;&gt;</c> only references
+    /// vanilla types. Critical: if our wrapper ends up in the save it makes the
+    /// save un-loadable without our mod (and brittle to future game updates).
+    /// </summary>
+    private void OnBeforeSave()
+    {
+        if (m_activeWrappers.Count == 0) return;
+        int unwrappedCount = 0;
+        foreach (var kv in m_activeWrappers)
+        {
+            try
+            {
+                var truck = TryGetTruckById(kv.Key);
+                if (truck == null) continue;
+                truck.ResetJobProvider();
+                truck.SetJobProvider(kv.Value.InnerProvider);
+                unwrappedCount++;
+            }
+            catch (Exception ex)
+            {
+                Log.Warning($"SmartMiningDumpMOD: OnBeforeSave swap-out failed for truck {kv.Key}: {ex.Message}");
+            }
+        }
+        Log.Info($"SmartMiningDumpMOD: BeforeSave — swapped {unwrappedCount} truck(s) back to vanilla provider.");
+        // Note: we do NOT clear m_activeWrappers here. The map still tracks
+        // which trucks we WANT wrapped; OnUpdateAfterSync re-installs them.
+    }
+
+    /// <summary>
+    /// Hooked to <see cref="ISimLoopEvents.UpdateAfterSync"/>. Restores the wrappers
+    /// we swapped out in OnBeforeSave so the dump-first behavior resumes after the
+    /// game returns to the normal sim loop.
+    /// </summary>
+    private void OnUpdateAfterSync()
+    {
+        if (m_activeWrappers.Count == 0) return;
+        int rewrappedCount = 0;
+        foreach (var kv in m_activeWrappers)
+        {
+            try
+            {
+                var truck = TryGetTruckById(kv.Key);
+                if (truck == null) continue;
+                // Only rewrap if the truck's current provider is the inner vanilla
+                // one (i.e., what we swapped to in BeforeSave). If something else
+                // changed the provider in between, leave it alone — the reconcile
+                // pass will fix it up.
+                truck.ResetJobProvider();
+                truck.SetJobProvider(kv.Value);
+                rewrappedCount++;
+            }
+            catch (Exception ex)
+            {
+                Log.Warning($"SmartMiningDumpMOD: OnUpdateAfterSync rewrap failed for truck {kv.Key}: {ex.Message}");
+            }
+        }
+        if (rewrappedCount > 0)
+            Log.Info($"SmartMiningDumpMOD: UpdateAfterSync — rewrapped {rewrappedCount} truck(s).");
+    }
+
+    /// <summary>
+    /// Walks every MineTower with toggle-ON and ensures all its assigned trucks
+    /// have our DumpFirstWrapper installed. Also unwraps any stale entries
+    /// (truck moved to a non-toggled tower, tower toggled off, truck despawned).
+    /// </summary>
+    private void ReconcileWrappers()
+    {
+        // Pass 1: wrap any unwrapped trucks on toggled towers.
         foreach (MineTower tower in m_entitiesManager.GetAllEntitiesOfType<MineTower>())
         {
             if (!DumpPreferenceManager.Instance.IsToggled(tower.Id)) continue;
 
-            // One-shot per-tower summary the first time we encounter it as toggled-ON.
-            // Logs IsEnabled, dump-designation count, dumpable products, assigned
-            // vehicle count — so it's obvious from the log whether the basic
-            // preconditions for interception are even met.
             if (m_summarizedTowerIds.Add(tower.Id.Value))
-            {
                 LogTowerSummary(tower);
-            }
 
-            if (!tower.IsEnabled) continue;
-            if (tower.ManagedDumpingDesignations.Count == 0) continue;
-
-            // Iterate assigned vehicles (AllVehicles is public, includes trucks + excavators)
             var allVehicles = tower.AllVehicles;
             int vehicleCount = allVehicles.Count;
             for (int i = 0; i < vehicleCount; i++)
             {
                 if (!(allVehicles[i] is Truck truck)) continue;
+                int truckId = truck.Id.Value;
 
-                // Compute skip reason before bailing so we can attribute it in the
-                // per-pair log. Each (tower, truck) pair logs only when its outcome
-                // string changes — so a truck that's permanently "has job" only
-                // logs once, but transitions truck→dump-attempted are still visible.
-                if (truck.HasJobs)
-                {
-                    RecordOutcome(tower, truck, "SKIP: HasJobs=true");
+                // Already wrapped for THIS tower? Skip.
+                if (m_activeWrappers.TryGetValue(truckId, out var existing) && existing.Tower == tower)
                     continue;
-                }
-                if (truck.Cargo.IsEmpty)
-                {
-                    RecordOutcome(tower, truck, "SKIP: Cargo.IsEmpty");
-                    continue;
-                }
-                if (!truck.IsEnabled)
-                {
-                    RecordOutcome(tower, truck, "SKIP: IsEnabled=false");
-                    continue;
-                }
 
-                TryAssignDumpJob(truck, tower);
+                // Wrapped for a different tower (truck just moved)? Unwrap first.
+                if (existing != null)
+                    UnwrapTruck(truck);
+
+                WrapTruck(truck, tower);
             }
         }
+
+        // Pass 2: unwrap stale entries (truck no longer in any toggled tower's
+        // assigned list, truck despawned, etc.).
+        if (m_activeWrappers.Count > 0)
+        {
+            List<int> stale = null;
+            foreach (var kv in m_activeWrappers)
+            {
+                var tower = kv.Value.Tower;
+                bool towerToggled = DumpPreferenceManager.Instance.IsToggled(tower.Id);
+                bool stillAssigned = false;
+                if (towerToggled)
+                {
+                    var allVehicles = tower.AllVehicles;
+                    for (int i = 0; i < allVehicles.Count; i++)
+                    {
+                        if (allVehicles[i] is Truck t && t.Id.Value == kv.Key)
+                        {
+                            stillAssigned = true;
+                            break;
+                        }
+                    }
+                }
+                if (!stillAssigned)
+                    (stale ?? (stale = new List<int>())).Add(kv.Key);
+            }
+            if (stale != null)
+            {
+                foreach (int truckId in stale)
+                {
+                    var truck = TryGetTruckById(truckId);
+                    if (truck != null)
+                        UnwrapTruck(truck);
+                    else
+                        m_activeWrappers.Remove(truckId); // truck despawned, just drop the entry
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Installs a <see cref="DumpFirstWrapper"/> on the given truck. The wrapper
+    /// remembers the original vanilla provider (read from the truck's current
+    /// m_jobProvider) so we can swap back cleanly later.
+    /// </summary>
+    private void WrapTruck(Truck truck, MineTower tower)
+    {
+        try
+        {
+            // Read current provider via reflection. We use a freshly-fetched value
+            // rather than tower.m_trucksJobProvider because in some edge cases the
+            // truck might transiently have a different provider (default truck
+            // provider during a reassignment race) — capturing the truck's actual
+            // current provider keeps swap-back faithful.
+            var currentProvider = GetTruckCurrentProvider(truck);
+            if (currentProvider == null)
+            {
+                Log.Warning($"SmartMiningDumpMOD: WrapTruck — truck {truck.Id} has no current provider; skipping.");
+                return;
+            }
+            if (currentProvider is DumpFirstWrapper)
+            {
+                // Already wrapped (defensive — should be caught by the reconcile filter).
+                return;
+            }
+
+            var wrapper = new DumpFirstWrapper(tower, currentProvider, this);
+            truck.ResetJobProvider();
+            truck.SetJobProvider(wrapper);
+            m_activeWrappers[truck.Id.Value] = wrapper;
+            RecordOutcome(tower, truck, "WRAPPED with DumpFirstWrapper");
+        }
+        catch (Exception ex)
+        {
+            Log.Warning($"SmartMiningDumpMOD: WrapTruck failed for truck {truck.Id} on tower {tower.Id}: {ex.Message}");
+        }
+    }
+
+    /// <summary>Removes our wrapper from a truck, restoring the inner vanilla provider.</summary>
+    private void UnwrapTruck(Truck truck)
+    {
+        int truckId = truck.Id.Value;
+        if (!m_activeWrappers.TryGetValue(truckId, out var wrapper))
+            return;
+        try
+        {
+            // Only swap-back if the truck's provider is still our wrapper. If
+            // something else (e.g. onTruckUnassigned) already reset it, just drop
+            // our map entry.
+            var current = GetTruckCurrentProvider(truck);
+            if (current == wrapper)
+            {
+                truck.ResetJobProvider();
+                truck.SetJobProvider(wrapper.InnerProvider);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warning($"SmartMiningDumpMOD: UnwrapTruck failed for truck {truck.Id}: {ex.Message}");
+        }
+        m_activeWrappers.Remove(truckId);
+    }
+
+    /// <summary>
+    /// Called from the inspector toggle's OnValueChanged callback (via
+    /// <see cref="Instance"/>) when the user flips a tower's preference. Wraps
+    /// (or unwraps) all the tower's assigned trucks immediately so the change
+    /// takes effect on the next job request, not on the next reconcile tick.
+    /// </summary>
+    public void OnTogglePreferenceChanged(MineTower tower, bool nowOn)
+    {
+        try
+        {
+            if (m_dumpJobFactory == null && !ExtractDumpFactoryFromTower(tower)) return;
+            if (!m_reflectionCached) CacheReflectionForHotPath();
+
+            var allVehicles = tower.AllVehicles;
+            int wrapped = 0, unwrapped = 0;
+            for (int i = 0; i < allVehicles.Count; i++)
+            {
+                if (!(allVehicles[i] is Truck truck)) continue;
+                if (nowOn)
+                {
+                    if (!m_activeWrappers.ContainsKey(truck.Id.Value))
+                    {
+                        WrapTruck(truck, tower);
+                        wrapped++;
+                    }
+                }
+                else
+                {
+                    if (m_activeWrappers.ContainsKey(truck.Id.Value))
+                    {
+                        UnwrapTruck(truck);
+                        unwrapped++;
+                    }
+                }
+            }
+            Log.Info($"SmartMiningDumpMOD: Tower {tower.Id} preference {(nowOn ? "ON" : "OFF")} — " +
+                $"wrapped={wrapped}, unwrapped={unwrapped}.");
+        }
+        catch (Exception ex)
+        {
+            Log.Warning($"SmartMiningDumpMOD: OnTogglePreferenceChanged failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>Reads a truck's current m_jobProvider via reflection (the field is private).</summary>
+    private static readonly FieldInfo s_truckJobProviderField = typeof(Truck)
+        .GetField("m_jobProvider", BindingFlags.NonPublic | BindingFlags.Instance);
+
+    private static IJobProvider<Truck> GetTruckCurrentProvider(Truck truck)
+    {
+        if (s_truckJobProviderField == null) return null;
+        var opt = s_truckJobProviderField.GetValue(truck);
+        // opt is Option<IJobProvider<Truck>>. Use reflection to read .ValueOrNull.
+        var valueOrNullProp = opt.GetType().GetProperty("ValueOrNull",
+            BindingFlags.Public | BindingFlags.Instance);
+        return valueOrNullProp?.GetValue(opt) as IJobProvider<Truck>;
+    }
+
+    private Truck TryGetTruckById(int truckId)
+    {
+        // EntitiesManager doesn't expose a clean ById<T> lookup we know of; scan.
+        // Trucks count is small (hundreds at most), called rarely (save/sync events).
+        foreach (var truck in m_entitiesManager.GetAllEntitiesOfType<Truck>())
+        {
+            if (truck.Id.Value == truckId) return truck;
+        }
+        return null;
     }
 
     private void LogTowerSummary(MineTower tower)
@@ -403,34 +672,38 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
     }
 
     /// <summary>
-    /// Attempts to create a dump job for the truck's cargo at the given tower's
-    /// dumping designations. Only dumps products that are in the tower's DumpableProducts.
-    /// Mine trucks typically carry a single product type, so we optimize for that case.
+    /// Called from <see cref="DumpFirstWrapper.TryGetJobFor"/> when the toggle is ON.
+    /// Attempts to enqueue a dump job for the truck's cargo. Returns true on success
+    /// (the wrapper then returns true to short-circuit vanilla's TryGetJobFor — the
+    /// storage-export priority is never consulted). On false, the wrapper falls
+    /// through to vanilla and the truck delivers to storage as it normally would.
+    ///
+    /// Filters:
+    /// - Cargo must be non-empty (defensive, the wrapper already checks).
+    /// - Cargo product must be in the tower's DumpableProducts (per-tower config).
     /// </summary>
-    private void TryAssignDumpJob(Truck truck, MineTower tower)
+    internal bool TryEnqueueDumpJob(Truck truck, MineTower tower)
     {
         // Mine trucks typically carry one product type — use FirstOrPhantom (no allocation)
         var first = truck.Cargo.FirstOrPhantom;
         if (first.IsEmpty)
         {
             RecordOutcome(tower, truck, "SKIP: Cargo became empty (race)");
-            return;
+            return false;
         }
 
         ProductProto product = first.Product;
 
-        // Only dump products that the tower has marked as dumpable
         if (!tower.DumpableProducts.Contains(product))
         {
             RecordOutcome(tower, truck,
                 $"SKIP: cargo '{product.Id.Value}' not in tower's DumpableProducts " +
                 $"(count={tower.DumpableProducts.Count})");
-            return;
+            return false;
         }
 
         // Build tower cache — restrict dump to this tower's zone + assigned input towers.
-        // Mirrors vanilla MineTowerTruckJobProvider.tryDumpAllCargoInAssignedTowersOrSelf
-        // which also includes the tower's AssignedInputTowers in the cache.
+        // Mirrors vanilla MineTowerTruckJobProvider.tryDumpAllCargoInAssignedTowersOrSelf.
         m_towerCache.Clear();
         m_towerCache.Add(tower);
         var inputTowers = tower.AssignedInputTowers;
@@ -450,7 +723,7 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
             truck.DumpingOfAllCargoPending = true;
             m_deactivateCannotDeliver?.Invoke(truck, null);
         }
-        // If dump failed, truck will fall through to normal TryGetJobFor in SimUpdateInternal
+        return success;
     }
 
     /// <summary>
@@ -884,7 +1157,8 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
                 .Label("Prefer Dumping over Storage".AsLoc())
                 .Tooltip("When enabled, trucks will try to dump dumpable materials at dumping/leveling designations before delivering to storage.".AsLoc());
 
-            // Wire up the toggle's value-changed callback (user → preference store).
+            // Wire up the toggle's value-changed callback (user → preference store +
+            // immediate wrap/unwrap of the tower's assigned trucks).
             toggle.OnValueChanged(value =>
             {
                 var entity = GetEntityFromInspector(inspector);
@@ -893,6 +1167,9 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
                     DumpPreferenceManager.Instance.SetToggle(entity.Id, value);
                     string state = value ? "ON" : "OFF";
                     Log.Info($"SmartMiningDumpMOD: Tower {entity.Id} dump preference: {state}");
+                    // Apply wrapping immediately so the change takes effect on the
+                    // next job request, not on the next ReconcileWrappers tick.
+                    SmartMiningDumpMod.Instance?.OnTogglePreferenceChanged(entity, value);
                 }
             });
 
@@ -1101,17 +1378,21 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
                     if (!first.IsEmpty) cargoProduct = first.Product;
                 }
 
+                // The new model is "is the wrapper installed on this truck?" — when
+                // installed, our DumpFirstWrapper.TryGetJobFor intercepts the truck's
+                // next job request and tries dump before vanilla storage logic.
+                bool isWrapped = m_activeWrappers.ContainsKey(truck.Id.Value);
+
                 string verdict;
-                if (truck.HasJobs)                          verdict = "SKIP HasJobs=true";
-                else if (truck.Cargo.IsEmpty)               verdict = "SKIP empty cargo";
-                else if (!truck.IsEnabled)                  verdict = "SKIP disabled";
-                else if (cargoProduct == null)              verdict = "SKIP cargo race";
+                if (!isWrapped)                              verdict = "NOT WRAPPED (will run vanilla logic next request)";
+                else if (truck.Cargo.IsEmpty)                verdict = "WRAPPED, empty cargo — next dump attempt on next loading";
+                else if (cargoProduct == null)               verdict = "WRAPPED, cargo race";
                 else if (!tower.DumpableProducts.Contains(cargoProduct))
-                                                            verdict = "SKIP product not in DumpableProducts";
-                else                                        verdict = "WOULD ATTEMPT dump";
+                                                             verdict = "WRAPPED, but cargo NOT in DumpableProducts → wrapper will fall through to vanilla";
+                else                                         verdict = "WRAPPED, cargo dumpable → wrapper will try dump on next job request";
 
                 sb.AppendLine($"    Truck {truck.Id}: HasJobs={truck.HasJobs}, " +
-                    $"IsEnabled={truck.IsEnabled}, Cargo={cargoDesc} → {verdict}");
+                    $"IsEnabled={truck.IsEnabled}, Wrapped={isWrapped}, Cargo={cargoDesc} → {verdict}");
             }
             if (truckIdx == 0)
                 sb.AppendLine("    (no trucks assigned)");
@@ -1205,5 +1486,91 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
             }
             catch { }
         }
+        if (m_simLoopEvents != null && m_beforeSaveAction != null)
+        {
+            try { m_simLoopEvents.BeforeSave.RemoveNonSaveable(this, m_beforeSaveAction); } catch { }
+        }
+        if (m_simLoopEvents != null && m_updateAfterSyncAction != null)
+        {
+            try { m_simLoopEvents.UpdateAfterSync.RemoveNonSaveable(this, m_updateAfterSyncAction); } catch { }
+        }
+
+        // Unwrap every truck on shutdown so the game returns to a clean state.
+        // This is also what happens at save time (OnBeforeSave) but doing it here
+        // covers the mod-disabled / mod-reload path too.
+        foreach (var kv in m_activeWrappers)
+        {
+            try
+            {
+                var truck = TryGetTruckById(kv.Key);
+                if (truck == null) continue;
+                truck.ResetJobProvider();
+                truck.SetJobProvider(kv.Value.InnerProvider);
+            }
+            catch { }
+        }
+        m_activeWrappers.Clear();
+
+        if (Instance == this) Instance = null;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DumpFirstWrapper
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// <summary>
+/// Decorates a tower's <see cref="MineTowerTruckJobProvider"/> with a "try dump
+/// first if the toggle is ON" behavior. Installed on a truck's m_jobProvider via
+/// <see cref="SmartMiningDumpMod.WrapTruck"/>; the truck's normal
+/// <c>tryGetJob()</c> path calls this wrapper's <see cref="TryGetJobFor"/>
+/// instead of the vanilla provider.
+///
+/// IMPORTANT (save-safety): this type MUST NEVER appear in a save file. The
+/// truck's m_jobProvider is serialized via <c>Option&lt;IJobProvider&lt;Truck&gt;&gt;.Serialize</c>
+/// → <c>BlobWriter.WriteGeneric</c>, which writes the runtime type name. If our
+/// wrapper is in there, loading the save requires our mod (and our exact type
+/// fully-qualified name) — fragile across mod updates and broken if the mod is
+/// uninstalled. <see cref="SmartMiningDumpMod.OnBeforeSave"/> unwraps all
+/// trucks before save; <see cref="SmartMiningDumpMod.OnUpdateAfterSync"/>
+/// re-wraps them after. The window between BeforeSave and the actual save
+/// write is on the sim thread (single-threaded), so there's no race.
+/// </summary>
+internal sealed class DumpFirstWrapper : IJobProvider<Truck>
+{
+    /// <summary>The tower this wrapper was installed for. Used to look up the
+    /// toggle preference and pass to <see cref="SmartMiningDumpMod.TryEnqueueDumpJob"/>.</summary>
+    public MineTower Tower { get; }
+
+    /// <summary>The original vanilla provider we're decorating. Saved here so
+    /// <see cref="SmartMiningDumpMod.OnBeforeSave"/> can swap back to it, and
+    /// <see cref="TryGetJobFor"/> can delegate when our dump path doesn't apply.</summary>
+    public IJobProvider<Truck> InnerProvider { get; }
+
+    private readonly SmartMiningDumpMod m_mod;
+
+    public DumpFirstWrapper(MineTower tower, IJobProvider<Truck> inner, SmartMiningDumpMod mod)
+    {
+        Tower = tower;
+        InnerProvider = inner;
+        m_mod = mod;
+    }
+
+    public bool TryGetJobFor(Truck truck)
+    {
+        // Fast-path checks before the (somewhat-allocating) TryEnqueueDumpJob.
+        if (DumpPreferenceManager.Instance != null
+            && DumpPreferenceManager.Instance.IsToggled(Tower.Id)
+            && Tower.IsEnabled
+            && Tower.ManagedDumpingDesignations.Count > 0
+            && truck.Cargo.IsNotEmpty
+            && truck.IsEnabled)
+        {
+            if (m_mod.TryEnqueueDumpJob(truck, Tower))
+                return true;
+            // Fall through to vanilla if dump factory returned false — better to
+            // deliver than to leave the truck stuck idle.
+        }
+        return InnerProvider.TryGetJobFor(truck);
     }
 }

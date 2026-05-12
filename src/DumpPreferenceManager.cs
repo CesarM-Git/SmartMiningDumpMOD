@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using Mafi;
+using Mafi.Core;
 using Mafi.Core.Entities;
 
 namespace SmartMiningDumpMod;

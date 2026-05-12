@@ -72,8 +72,17 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
     // ── Sim event delegates (stored for unsubscribe) ────────────────────
     private Action m_updateStartAction;
 
-    // ── Inspector toggle sync ───────────────────────────────────────────
-    /// <summary>
+    // ── Diagnostics ─────────────────────────────────────────────────────
+    // Towers we've logged a summary for at least once this session. Prevents
+    // OnUpdateStart from spamming the log: we summarize each tower only the
+    // first time we see it as toggled-ON during a session.
+    private readonly HashSet<int> m_summarizedTowerIds = new HashSet<int>();
+    // (tower.Id, truck.Id) pairs we've logged a dump-attempt verdict for at
+    // least once. Prevents per-tick spam — each pair logs its first outcome,
+    // and only re-logs if the outcome changes (tracked separately below).
+    private readonly Dictionary<long, string> m_lastAttemptOutcome
+        = new Dictionary<long, string>();
+
     // ═══════════════════════════════════════════════════════════════════
     // IMod lifecycle
     // ═══════════════════════════════════════════════════════════════════
@@ -308,8 +317,18 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
 
         foreach (MineTower tower in m_entitiesManager.GetAllEntitiesOfType<MineTower>())
         {
-            if (!tower.IsEnabled) continue;
             if (!DumpPreferenceManager.Instance.IsToggled(tower.Id)) continue;
+
+            // One-shot per-tower summary the first time we encounter it as toggled-ON.
+            // Logs IsEnabled, dump-designation count, dumpable products, assigned
+            // vehicle count — so it's obvious from the log whether the basic
+            // preconditions for interception are even met.
+            if (m_summarizedTowerIds.Add(tower.Id.Value))
+            {
+                LogTowerSummary(tower);
+            }
+
+            if (!tower.IsEnabled) continue;
             if (tower.ManagedDumpingDesignations.Count == 0) continue;
 
             // Iterate assigned vehicles (AllVehicles is public, includes trucks + excavators)
@@ -318,13 +337,69 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
             for (int i = 0; i < vehicleCount; i++)
             {
                 if (!(allVehicles[i] is Truck truck)) continue;
-                if (truck.HasJobs) continue;
-                if (truck.Cargo.IsEmpty) continue;
-                if (!truck.IsEnabled) continue;
+
+                // Compute skip reason before bailing so we can attribute it in the
+                // per-pair log. Each (tower, truck) pair logs only when its outcome
+                // string changes — so a truck that's permanently "has job" only
+                // logs once, but transitions truck→dump-attempted are still visible.
+                if (truck.HasJobs)
+                {
+                    RecordOutcome(tower, truck, "SKIP: HasJobs=true");
+                    continue;
+                }
+                if (truck.Cargo.IsEmpty)
+                {
+                    RecordOutcome(tower, truck, "SKIP: Cargo.IsEmpty");
+                    continue;
+                }
+                if (!truck.IsEnabled)
+                {
+                    RecordOutcome(tower, truck, "SKIP: IsEnabled=false");
+                    continue;
+                }
 
                 TryAssignDumpJob(truck, tower);
             }
         }
+    }
+
+    private void LogTowerSummary(MineTower tower)
+    {
+        try
+        {
+            int vehicleCount = tower.AllVehicles.Count;
+            int truckCount = 0;
+            for (int i = 0; i < vehicleCount; i++)
+                if (tower.AllVehicles[i] is Truck) truckCount++;
+
+            string dumpableProducts = string.Join(", ",
+                tower.DumpableProducts.Select(p => p.Id.Value));
+            if (string.IsNullOrEmpty(dumpableProducts)) dumpableProducts = "<none>";
+
+            Log.Info($"SmartMiningDumpMOD: Tower {tower.Id} summary on first toggle-ON encounter: " +
+                $"IsEnabled={tower.IsEnabled}, " +
+                $"DumpingDesignations={tower.ManagedDumpingDesignations.Count}, " +
+                $"Vehicles={vehicleCount} (Trucks={truckCount}), " +
+                $"DumpableProducts=[{dumpableProducts}], " +
+                $"AssignedInputTowers={tower.AssignedInputTowers.Count}.");
+        }
+        catch (Exception ex)
+        {
+            Log.Warning($"SmartMiningDumpMOD: LogTowerSummary failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Logs a (tower, truck) outcome only when the outcome string changes from the
+    /// previously-recorded one. This naturally rate-limits — a truck stuck in
+    /// "HasJobs=true" logs once and stays silent until it transitions.
+    /// </summary>
+    private void RecordOutcome(MineTower tower, Truck truck, string outcome)
+    {
+        long key = ((long)tower.Id.Value << 32) | (uint)truck.Id.Value;
+        if (m_lastAttemptOutcome.TryGetValue(key, out string prev) && prev == outcome) return;
+        m_lastAttemptOutcome[key] = outcome;
+        Log.Info($"SmartMiningDumpMOD: Tower {tower.Id} truck {truck.Id}: {outcome}.");
     }
 
     /// <summary>
@@ -336,19 +411,41 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
     {
         // Mine trucks typically carry one product type — use FirstOrPhantom (no allocation)
         var first = truck.Cargo.FirstOrPhantom;
-        if (first.IsEmpty) return;
+        if (first.IsEmpty)
+        {
+            RecordOutcome(tower, truck, "SKIP: Cargo became empty (race)");
+            return;
+        }
 
         ProductProto product = first.Product;
 
         // Only dump products that the tower has marked as dumpable
         if (!tower.DumpableProducts.Contains(product))
+        {
+            RecordOutcome(tower, truck,
+                $"SKIP: cargo '{product.Id.Value}' not in tower's DumpableProducts " +
+                $"(count={tower.DumpableProducts.Count})");
             return;
+        }
 
-        // Build tower cache — restrict dump to this tower's zone + assigned input towers
+        // Build tower cache — restrict dump to this tower's zone + assigned input towers.
+        // Mirrors vanilla MineTowerTruckJobProvider.tryDumpAllCargoInAssignedTowersOrSelf
+        // which also includes the tower's AssignedInputTowers in the cache.
         m_towerCache.Clear();
         m_towerCache.Add(tower);
+        var inputTowers = tower.AssignedInputTowers;
+        int inputCount = inputTowers.Count;
+        for (int i = 0; i < inputCount; i++)
+            m_towerCache.Add(inputTowers[i]);
 
-        if (InvokeDumpFactory(truck, product))
+        bool success = InvokeDumpFactory(truck, product);
+        RecordOutcome(tower, truck,
+            success
+                ? $"DUMP ASSIGNED for '{product.Id.Value}' (cargo qty={first.Quantity.Value})"
+                : $"DUMP FAILED: factory returned false for '{product.Id.Value}' " +
+                  $"(towersInScope={m_towerCache.Count}, dumpDesigs={tower.ManagedDumpingDesignations.Count})");
+
+        if (success)
         {
             truck.DumpingOfAllCargoPending = true;
             m_deactivateCannotDeliver?.Invoke(truck, null);
@@ -948,6 +1045,76 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
             int dumpProducts = tower.DumpableProducts.Count;
             string status = isOn ? "ON " : "OFF";
             sb.AppendLine($"  Tower {tower.Id}: [{status}] DumpDesigns={dumpDesigs} DumpProducts={dumpProducts}");
+        }
+        return sb.ToString();
+    }
+
+    [ConsoleCommand(documentation: "Per-tower-and-truck diagnostic dump for ALL toggled-ON mine towers. Shows IsEnabled, dump designations, DumpableProducts, AssignedInputTowers, and per-assigned-truck state (HasJobs, Cargo, IsEnabled). Run this WHILE trucks are misbehaving so we can see which condition is failing. Usage: smart_dump_diag")]
+    private string SmartDumpDiag()
+    {
+        if (DumpPreferenceManager.Instance == null)
+            return "Error: DumpPreferenceManager not initialized.";
+
+        var towers = m_entitiesManager.GetAllEntitiesOfType<MineTower>()
+            .Where(t => DumpPreferenceManager.Instance.IsToggled(t.Id))
+            .ToList();
+        if (towers.Count == 0)
+            return "No toggled-ON mine towers found. Toggle one in its inspector first.";
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"=== Smart Dump Diagnostics ({towers.Count} toggled tower(s)) ===");
+        foreach (var tower in towers)
+        {
+            string dumpableProducts = string.Join(", ",
+                tower.DumpableProducts.Select(p => p.Id.Value));
+            if (string.IsNullOrEmpty(dumpableProducts)) dumpableProducts = "<none>";
+
+            sb.AppendLine();
+            sb.AppendLine($"Tower {tower.Id} [ON]:");
+            sb.AppendLine($"  IsEnabled:            {tower.IsEnabled}");
+            sb.AppendLine($"  DumpingDesignations:  {tower.ManagedDumpingDesignations.Count}");
+            sb.AppendLine($"  DumpableProducts:     [{dumpableProducts}]");
+            sb.AppendLine($"  AssignedInputTowers:  {tower.AssignedInputTowers.Count}");
+            sb.AppendLine($"  AssignedVehicles:     {tower.AllVehicles.Count}");
+
+            // Pre-filter reasons mirror those in OnUpdateStart — but here we print
+            // for every truck so the user can spot patterns (all stuck on "HasJobs",
+            // or all stuck on "Cargo not in DumpableProducts", etc.).
+            int vehicleCount = tower.AllVehicles.Count;
+            int truckIdx = 0;
+            for (int i = 0; i < vehicleCount; i++)
+            {
+                if (!(tower.AllVehicles[i] is Truck truck)) continue;
+                truckIdx++;
+
+                string cargoDesc;
+                ProductProto cargoProduct = null;
+                if (truck.Cargo.IsEmpty)
+                {
+                    cargoDesc = "<empty>";
+                }
+                else
+                {
+                    var first = truck.Cargo.FirstOrPhantom;
+                    cargoDesc = first.IsEmpty ? "<empty>" :
+                        $"{first.Product.Id.Value} qty={first.Quantity.Value}";
+                    if (!first.IsEmpty) cargoProduct = first.Product;
+                }
+
+                string verdict;
+                if (truck.HasJobs)                          verdict = "SKIP HasJobs=true";
+                else if (truck.Cargo.IsEmpty)               verdict = "SKIP empty cargo";
+                else if (!truck.IsEnabled)                  verdict = "SKIP disabled";
+                else if (cargoProduct == null)              verdict = "SKIP cargo race";
+                else if (!tower.DumpableProducts.Contains(cargoProduct))
+                                                            verdict = "SKIP product not in DumpableProducts";
+                else                                        verdict = "WOULD ATTEMPT dump";
+
+                sb.AppendLine($"    Truck {truck.Id}: HasJobs={truck.HasJobs}, " +
+                    $"IsEnabled={truck.IsEnabled}, Cargo={cargoDesc} → {verdict}");
+            }
+            if (truckIdx == 0)
+                sb.AppendLine("    (no trucks assigned)");
         }
         return sb.ToString();
     }

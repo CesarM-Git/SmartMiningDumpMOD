@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
@@ -631,20 +632,34 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
             Log.Info($"SmartMiningDumpMOD: MineTowerInspector ctor has {paramTypes.Length} params: " +
                 string.Join(", ", paramTypes.Select(t => t.Name)));
 
+            // MineTowerInspector is `internal class` in Mafi.Unity. Without bypassing
+            // the cross-assembly visibility check, the emitted ctor's `call base..ctor`
+            // throws MethodAccessException at invoke time (observed in Player.log).
+            //
+            // The fix is IgnoresAccessChecksTo, BUT Unity's Mono fork is known to
+            // ignore that attribute on dynamic assemblies built with
+            // AssemblyBuilderAccess.Run — the JIT only checks the attribute reliably
+            // for assemblies loaded from disk. So:
+            //   1. Build the dynamic assembly with RunAndSave.
+            //   2. Stamp IgnoresAccessChecksTo("Mafi.Unity") onto it.
+            //   3. Save it to a temp file on disk.
+            //   4. Reload it via Assembly.LoadFrom so the JIT honors the attribute.
+            string tempDir = Path.Combine(Path.GetTempPath(), "SmartMiningDumpMOD");
+            Directory.CreateDirectory(tempDir);
+
+            string dynAsmFileName = "SmartMiningDumpMOD.Dynamic.dll";
             var assemblyName = new AssemblyName("SmartMiningDumpMOD.Dynamic");
             AssemblyBuilder assemblyBuilder = AppDomain.CurrentDomain.DefineDynamicAssembly(
-                assemblyName, AssemblyBuilderAccess.Run);
+                assemblyName, AssemblyBuilderAccess.RunAndSave, tempDir);
 
-            // MineTowerInspector is `internal class` in Mafi.Unity. The emitted ctor's
-            // `call base..ctor` would otherwise throw MethodAccessException at invoke.
-            // IgnoresAccessChecksTo on THIS (dynamic) assembly tells the Mono JIT to
-            // skip the cross-assembly visibility check for calls into Mafi.Unity.
             var ignoreCtor = typeof(System.Runtime.CompilerServices.IgnoresAccessChecksToAttribute)
                 .GetConstructor(new[] { typeof(string) });
             assemblyBuilder.SetCustomAttribute(
                 new CustomAttributeBuilder(ignoreCtor, new object[] { "Mafi.Unity" }));
 
-            ModuleBuilder moduleBuilder = assemblyBuilder.DefineDynamicModule("MainModule");
+            // When using RunAndSave, DefineDynamicModule requires a filename — this is
+            // the file Save() will write.
+            ModuleBuilder moduleBuilder = assemblyBuilder.DefineDynamicModule("MainModule", dynAsmFileName);
 
             TypeBuilder typeBuilder = moduleBuilder.DefineType(
                 "SmartMiningDumpMOD.SmartMineTowerInspector_Runtime",
@@ -698,7 +713,26 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
                 Log.Warning("SmartMiningDumpMOD: OnActivated method not found; toggle won't sync on entity switch.");
             }
 
-            return typeBuilder.CreateType();
+            // Bake the type into the in-memory module.
+            typeBuilder.CreateType();
+
+            // Save the dynamic assembly to disk so the JIT honors IgnoresAccessChecksTo.
+            assemblyBuilder.Save(dynAsmFileName);
+            string savedPath = Path.Combine(tempDir, dynAsmFileName);
+            Log.Info($"SmartMiningDumpMOD: Saved dynamic assembly to '{savedPath}'.");
+
+            // Reload from disk. The reloaded Assembly is a distinct identity from the
+            // in-memory AssemblyBuilder, and its IgnoresAccessChecksTo metadata is read
+            // from the file on the JIT's normal load path — that's the path Mono honors.
+            Assembly reloaded = Assembly.LoadFrom(savedPath);
+            Type reloadedType = reloaded.GetType("SmartMiningDumpMOD.SmartMineTowerInspector_Runtime");
+            if (reloadedType == null)
+            {
+                Log.Error("SmartMiningDumpMOD: Could not find SmartMineTowerInspector_Runtime in reloaded assembly.");
+                return null;
+            }
+            Log.Info($"SmartMiningDumpMOD: Reloaded type from disk: {reloadedType.AssemblyQualifiedName}");
+            return reloadedType;
         }
         catch (Exception ex)
         {

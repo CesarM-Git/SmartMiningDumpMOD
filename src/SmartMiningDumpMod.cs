@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Reflection.Emit;
 using Mafi;
 using Mafi.Collections;
 using Mafi.Core;
@@ -20,6 +21,8 @@ using Mafi.Localization;
 using Mafi.Unity.Ui;
 using Mafi.Unity.UiToolkit.Component;
 using Mafi.Unity.UiToolkit.Library;
+// Disambiguate Label between Mafi.Unity.UiToolkit.Library.Label and System.Reflection.Emit.Label.
+using Label = Mafi.Unity.UiToolkit.Library.Label;
 
 namespace SmartMiningDumpMod;
 

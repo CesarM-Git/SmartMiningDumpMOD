@@ -634,6 +634,16 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
             var assemblyName = new AssemblyName("SmartMiningDumpMOD.Dynamic");
             AssemblyBuilder assemblyBuilder = AppDomain.CurrentDomain.DefineDynamicAssembly(
                 assemblyName, AssemblyBuilderAccess.Run);
+
+            // MineTowerInspector is `internal class` in Mafi.Unity. The emitted ctor's
+            // `call base..ctor` would otherwise throw MethodAccessException at invoke.
+            // IgnoresAccessChecksTo on THIS (dynamic) assembly tells the Mono JIT to
+            // skip the cross-assembly visibility check for calls into Mafi.Unity.
+            var ignoreCtor = typeof(System.Runtime.CompilerServices.IgnoresAccessChecksToAttribute)
+                .GetConstructor(new[] { typeof(string) });
+            assemblyBuilder.SetCustomAttribute(
+                new CustomAttributeBuilder(ignoreCtor, new object[] { "Mafi.Unity" }));
+
             ModuleBuilder moduleBuilder = assemblyBuilder.DefineDynamicModule("MainModule");
 
             TypeBuilder typeBuilder = moduleBuilder.DefineType(

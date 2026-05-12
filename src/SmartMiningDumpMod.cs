@@ -752,16 +752,26 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
     {
         try
         {
-            // Find AddPanelRow in the type hierarchy
+            // Find AddPanelRow in the type hierarchy. BaseInspector has TWO
+            // overloads: (Action<Row>, params UiComponent[]) and (params UiComponent[]).
+            // We want the first one — predicate selects it by checking the 2-arg
+            // signature where the second arg is an array.
             MethodInfo addPanelRow = FindMethodInHierarchy(inspector.GetType(),
-                "AddPanelRow", BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance);
+                "AddPanelRow",
+                BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance,
+                m =>
+                {
+                    var ps = m.GetParameters();
+                    return ps.Length == 2 && ps[1].ParameterType.IsArray;
+                });
 
-            // Find AddPanelWithHeader as fallback
+            // Find AddPanelWithHeader as fallback (no overload disambiguation needed).
             MethodInfo addPanelWithHeader = null;
             if (addPanelRow == null)
             {
                 addPanelWithHeader = FindMethodInHierarchy(inspector.GetType(),
-                    "AddPanelWithHeader", BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance);
+                    "AddPanelWithHeader",
+                    BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance);
             }
 
             if (addPanelRow == null && addPanelWithHeader == null)
@@ -970,12 +980,26 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
     // Helpers
     // ═══════════════════════════════════════════════════════════════════
 
-    private static MethodInfo FindMethodInHierarchy(Type type, string name, BindingFlags flags)
+    /// <summary>
+    /// Walks the type hierarchy looking for a method by name. Avoids
+    /// <see cref="Type.GetMethod(string, BindingFlags)"/> because that throws
+    /// <see cref="AmbiguousMatchException"/> when the name has overloads — which
+    /// is exactly the case for <c>BaseInspector.AddPanelRow</c> (2 overloads:
+    /// <c>(Action&lt;Row&gt;, params UiComponent[])</c> and <c>(params UiComponent[])</c>).
+    ///
+    /// Pass a <paramref name="predicate"/> to disambiguate; the first matching
+    /// method (by walking declaring-type → base-type) is returned.
+    /// </summary>
+    private static MethodInfo FindMethodInHierarchy(Type type, string name, BindingFlags flags,
+        Func<MethodInfo, bool> predicate = null)
     {
         while (type != null)
         {
-            var method = type.GetMethod(name, flags | BindingFlags.DeclaredOnly);
-            if (method != null) return method;
+            foreach (var m in type.GetMethods(flags | BindingFlags.DeclaredOnly))
+            {
+                if (m.Name != name) continue;
+                if (predicate == null || predicate(m)) return m;
+            }
             type = type.BaseType;
         }
         return null;

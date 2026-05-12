@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
-using System.Reflection.Emit;
 using Mafi;
 using Mafi.Collections;
 using Mafi.Core;
@@ -721,10 +720,12 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
                 return;
             }
 
-            // Create a Toggle component
-            // Toggle constructor: Toggle(LocStrFormatted label)
-            var toggle = new Toggle("Prefer Dumping over Storage".AsLoc());
-            toggle.Tooltip("When enabled, trucks will try to dump dumpable materials at dumping/leveling designations before delivering to storage.".AsLoc());
+            // Create a Toggle component.
+            // Toggle's only constructor is Toggle(bool standalone). The label is set
+            // via the .Label(LocStrFormatted) extension method on IComponentWithLabel.
+            var toggle = new Toggle(standalone: true)
+                .Label("Prefer Dumping over Storage".AsLoc())
+                .Tooltip("When enabled, trucks will try to dump dumpable materials at dumping/leveling designations before delivering to storage.".AsLoc());
 
             // Wire up the toggle's value-changed callback
             toggle.OnValueChanged(value =>

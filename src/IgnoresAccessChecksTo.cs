@@ -9,11 +9,17 @@
 // MethodAccessException at JIT/invoke time (see Player.log 17:02:41).
 //
 // We attach the attribute to BOTH:
-//   1. This static assembly (SmartMiningDumpMOD)   — see below.
+//   1. This static assembly (SmartMiningDumpMOD)   — the [assembly: ...] below.
 //   2. The dynamic assembly (SmartMiningDumpMOD.Dynamic) at emit time,
 //      via CustomAttributeBuilder in BuildDynamicInspectorType.
 // (Only #2 is strictly required for the inspector subclass, since the offending
 // IL lives there; #1 is cheap insurance for any future reflection-based code.)
+//
+// NOTE: assembly attributes must precede all other elements in the file
+// (CS1730), even if they reference types declared later in the same file —
+// attribute resolution happens across the whole compilation, not file order.
+
+[assembly: System.Runtime.CompilerServices.IgnoresAccessChecksTo("Mafi.Unity")]
 
 namespace System.Runtime.CompilerServices
 {
@@ -28,5 +34,3 @@ namespace System.Runtime.CompilerServices
         public string AssemblyName { get; }
     }
 }
-
-[assembly: System.Runtime.CompilerServices.IgnoresAccessChecksTo("Mafi.Unity")]

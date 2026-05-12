@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
@@ -75,18 +74,6 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
 
     // ── Inspector toggle sync ───────────────────────────────────────────
     /// <summary>
-    /// Maps inspector instances to their Toggle components for state sync
-    /// when the user selects a different MineTower.
-    /// </summary>
-    internal static readonly Dictionary<object, ToggleState> InspectorToggles
-        = new Dictionary<object, ToggleState>();
-
-    internal class ToggleState
-    {
-        public object Toggle;          // Mafi Toggle component
-        public MethodInfo SetValueMethod;
-    }
-
     // ═══════════════════════════════════════════════════════════════════
     // IMod lifecycle
     // ═══════════════════════════════════════════════════════════════════
@@ -632,41 +619,48 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
             Log.Info($"SmartMiningDumpMOD: MineTowerInspector ctor has {paramTypes.Length} params: " +
                 string.Join(", ", paramTypes.Select(t => t.Name)));
 
-            // MineTowerInspector is `internal class` in Mafi.Unity. Without bypassing
-            // the cross-assembly visibility check, the emitted ctor's `call base..ctor`
-            // throws MethodAccessException at invoke time (observed in Player.log).
+            // MineTowerInspector is `internal class` in Mafi.Unity. Earlier attempts
+            // emitted IL that called the internal base ctor directly via `call`. That
+            // hits the JIT's cross-assembly access check and throws MethodAccessException.
+            // Unity's Mono fork does NOT honor IgnoresAccessChecksTo (tried both Run and
+            // RunAndSave + Assembly.LoadFrom — both still threw).
             //
-            // The fix is IgnoresAccessChecksTo, BUT Unity's Mono fork is known to
-            // ignore that attribute on dynamic assemblies built with
-            // AssemblyBuilderAccess.Run — the JIT only checks the attribute reliably
-            // for assemblies loaded from disk. So:
-            //   1. Build the dynamic assembly with RunAndSave.
-            //   2. Stamp IgnoresAccessChecksTo("Mafi.Unity") onto it.
-            //   3. Save it to a temp file on disk.
-            //   4. Reload it via Assembly.LoadFrom so the JIT honors the attribute.
-            string tempDir = Path.Combine(Path.GetTempPath(), "SmartMiningDumpMOD");
-            Directory.CreateDirectory(tempDir);
-
-            string dynAsmFileName = "SmartMiningDumpMOD.Dynamic.dll";
+            // Solution: don't emit a `call` to the internal ctor at all. Our IL only
+            // references public types (Object's ctor + static helpers in our own
+            // assembly). The actual base-ctor invocation is done via reflection in
+            // InvokeBaseCtor — reflection's access check operates on the *member*
+            // (which is `public`), not the *type*'s visibility from the caller, so
+            // a public ctor on an internal type IS reflectively invocable.
+            //
+            // The emitted IL technically violates "derived ctor must call its immediate
+            // base ctor", but Mono doesn't verify dynamic-assembly IL in Run mode — it
+            // JITs whatever bytecode we hand it. The end result is identical: by the
+            // time AddDumpPreferenceToggle runs, MineTowerInspector's ctor body has
+            // initialized all inherited fields (via the reflective Invoke).
             var assemblyName = new AssemblyName("SmartMiningDumpMOD.Dynamic");
             AssemblyBuilder assemblyBuilder = AppDomain.CurrentDomain.DefineDynamicAssembly(
-                assemblyName, AssemblyBuilderAccess.RunAndSave, tempDir);
-
-            var ignoreCtor = typeof(System.Runtime.CompilerServices.IgnoresAccessChecksToAttribute)
-                .GetConstructor(new[] { typeof(string) });
-            assemblyBuilder.SetCustomAttribute(
-                new CustomAttributeBuilder(ignoreCtor, new object[] { "Mafi.Unity" }));
-
-            // When using RunAndSave, DefineDynamicModule requires a filename — this is
-            // the file Save() will write.
-            ModuleBuilder moduleBuilder = assemblyBuilder.DefineDynamicModule("MainModule", dynAsmFileName);
+                assemblyName, AssemblyBuilderAccess.Run);
+            ModuleBuilder moduleBuilder = assemblyBuilder.DefineDynamicModule("MainModule");
 
             TypeBuilder typeBuilder = moduleBuilder.DefineType(
                 "SmartMiningDumpMOD.SmartMineTowerInspector_Runtime",
                 TypeAttributes.Public | TypeAttributes.Class,
                 baseInspectorType);
 
-            // ── Constructor: call base ctor, then our static helper ──
+            // ── Constructor ──
+            // The emitted IL avoids any `call` to the internal MineTowerInspector..ctor.
+            // Instead it:
+            //   1. Calls Object..ctor() (always public, always accessible).
+            //   2. Packs args into object[] and calls InvokeBaseCtor(this, args),
+            //      which reflectively invokes the internal base ctor on `this`.
+            //      Reflection.Invoke uses *member*-level access checks, not type-level,
+            //      so the public-ctor-on-internal-type call succeeds where IL `call` fails.
+            //   3. Calls AddDumpPreferenceToggle(this) to wire up the toggle UI.
+            //
+            // OnActivated is NOT overridden anymore — extending an internal type's
+            // protected method has the same problem as the ctor, and we don't need
+            // an override anyway: AddDumpPreferenceToggle now uses ObserveValue() to
+            // keep the toggle's visual state reactive to the inspector's current entity.
             ConstructorBuilder ctorBuilder = typeBuilder.DefineConstructor(
                 MethodAttributes.Public,
                 CallingConventions.Standard,
@@ -675,70 +669,79 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
             MethodInfo addToggleMethod = typeof(SmartMiningDumpMod).GetMethod(
                 nameof(AddDumpPreferenceToggle),
                 BindingFlags.Public | BindingFlags.Static);
+            MethodInfo invokeBaseCtorMethod = typeof(SmartMiningDumpMod).GetMethod(
+                nameof(InvokeBaseCtor),
+                BindingFlags.Public | BindingFlags.Static);
+            ConstructorInfo objectCtor = typeof(object).GetConstructor(Type.EmptyTypes);
 
             ILGenerator ctorIl = ctorBuilder.GetILGenerator();
-            ctorIl.Emit(OpCodes.Ldarg_0);
-            for (int i = 0; i < paramTypes.Length; i++)
-                ctorIl.Emit(OpCodes.Ldarg_S, (byte)(i + 1));
-            ctorIl.Emit(OpCodes.Call, baseCtor);
 
-            // Call AddDumpPreferenceToggle(this)
+            // 1. Call Object..ctor() on `this`.
+            //    Unverifiable (we're skipping over MineTowerInspector's ctor) but Mono
+            //    accepts it under AssemblyBuilderAccess.Run.
+            ctorIl.Emit(OpCodes.Ldarg_0);
+            ctorIl.Emit(OpCodes.Call, objectCtor);
+
+            // 2. Call InvokeBaseCtor(this, new object[] { arg1, arg2, ... }).
+            ctorIl.Emit(OpCodes.Ldarg_0);                       // arg 0 of InvokeBaseCtor: instance
+            ctorIl.Emit(OpCodes.Ldc_I4, paramTypes.Length);
+            ctorIl.Emit(OpCodes.Newarr, typeof(object));        // new object[N]
+            for (int i = 0; i < paramTypes.Length; i++)
+            {
+                ctorIl.Emit(OpCodes.Dup);
+                ctorIl.Emit(OpCodes.Ldc_I4, i);
+                ctorIl.Emit(OpCodes.Ldarg_S, (byte)(i + 1));
+                // All ctor params are reference types (UiContext, TowerAreasRenderer,
+                // AssignedBuildingsHighlighter, BuildingsAssigner,
+                // NewInstanceOf<PolygonAreaSelectionController>) — no Box needed.
+                ctorIl.Emit(OpCodes.Stelem_Ref);
+            }
+            ctorIl.Emit(OpCodes.Call, invokeBaseCtorMethod);
+
+            // 3. Call AddDumpPreferenceToggle(this).
             ctorIl.Emit(OpCodes.Ldarg_0);
             ctorIl.Emit(OpCodes.Call, addToggleMethod);
+
             ctorIl.Emit(OpCodes.Ret);
 
-            // ── Override OnActivated: call base, then sync toggle ──
-            MethodInfo baseOnActivated = baseInspectorType.GetMethod("OnActivated",
-                BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Public);
-
-            if (baseOnActivated != null)
-            {
-                MethodInfo syncMethod = typeof(SmartMiningDumpMod).GetMethod(
-                    nameof(SyncInspectorToggle),
-                    BindingFlags.Public | BindingFlags.Static);
-
-                MethodBuilder onActivatedOverride = typeBuilder.DefineMethod("OnActivated",
-                    MethodAttributes.Family | MethodAttributes.Virtual | MethodAttributes.HideBySig,
-                    typeof(void), Type.EmptyTypes);
-
-                ILGenerator oaIl = onActivatedOverride.GetILGenerator();
-                oaIl.Emit(OpCodes.Ldarg_0);
-                oaIl.Emit(OpCodes.Call, baseOnActivated);
-                oaIl.Emit(OpCodes.Ldarg_0);
-                oaIl.Emit(OpCodes.Call, syncMethod);
-                oaIl.Emit(OpCodes.Ret);
-            }
-            else
-            {
-                Log.Warning("SmartMiningDumpMOD: OnActivated method not found; toggle won't sync on entity switch.");
-            }
-
-            // Bake the type into the in-memory module.
-            typeBuilder.CreateType();
-
-            // Save the dynamic assembly to disk so the JIT honors IgnoresAccessChecksTo.
-            assemblyBuilder.Save(dynAsmFileName);
-            string savedPath = Path.Combine(tempDir, dynAsmFileName);
-            Log.Info($"SmartMiningDumpMOD: Saved dynamic assembly to '{savedPath}'.");
-
-            // Reload from disk. The reloaded Assembly is a distinct identity from the
-            // in-memory AssemblyBuilder, and its IgnoresAccessChecksTo metadata is read
-            // from the file on the JIT's normal load path — that's the path Mono honors.
-            Assembly reloaded = Assembly.LoadFrom(savedPath);
-            Type reloadedType = reloaded.GetType("SmartMiningDumpMOD.SmartMineTowerInspector_Runtime");
-            if (reloadedType == null)
-            {
-                Log.Error("SmartMiningDumpMOD: Could not find SmartMineTowerInspector_Runtime in reloaded assembly.");
-                return null;
-            }
-            Log.Info($"SmartMiningDumpMOD: Reloaded type from disk: {reloadedType.AssemblyQualifiedName}");
-            return reloadedType;
+            return typeBuilder.CreateType();
         }
         catch (Exception ex)
         {
             Log.Error($"SmartMiningDumpMOD: BuildDynamicInspectorType failed: {ex}");
             return null;
         }
+    }
+
+    /// <summary>
+    /// Reflectively invokes the base inspector's ctor on the already-allocated
+    /// <paramref name="instance"/>. Called from the IL-emitted subclass ctor in
+    /// place of an unverifiable `call MineTowerInspector..ctor` (which would throw
+    /// MethodAccessException since MineTowerInspector is `internal class`).
+    ///
+    /// Why this works: Mono's reflection access check looks at the member's
+    /// declared accessibility (the ctor is `public`), not the type's accessibility
+    /// from the caller's assembly. So a public ctor on an internal type can be
+    /// invoked via reflection from another assembly even though it can't be
+    /// reached via a direct IL `call` instruction.
+    ///
+    /// ConstructorInfo.Invoke(object, object[]) — when the first argument is
+    /// non-null — invokes the ctor body on the given instance rather than
+    /// allocating a new one. This is the same pattern .NET's deserialization
+    /// frameworks use after FormatterServices.GetUninitializedObject.
+    /// </summary>
+    public static void InvokeBaseCtor(object instance, object[] args)
+    {
+        var baseType = instance.GetType().BaseType;
+        var ctor = baseType
+            .GetConstructors(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            .FirstOrDefault();
+        if (ctor == null)
+        {
+            Log.Error($"SmartMiningDumpMOD: InvokeBaseCtor — no ctor on {baseType.FullName}.");
+            return;
+        }
+        ctor.Invoke(instance, args);
     }
 
     /// <summary>
@@ -774,7 +777,7 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
                 .Label("Prefer Dumping over Storage".AsLoc())
                 .Tooltip("When enabled, trucks will try to dump dumpable materials at dumping/leveling designations before delivering to storage.".AsLoc());
 
-            // Wire up the toggle's value-changed callback
+            // Wire up the toggle's value-changed callback (user → preference store).
             toggle.OnValueChanged(value =>
             {
                 var entity = GetEntityFromInspector(inspector);
@@ -784,6 +787,18 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
                     string state = value ? "ON" : "OFF";
                     Log.Info($"SmartMiningDumpMOD: Tower {entity.Id} dump preference: {state}");
                 }
+            });
+
+            // Reactive sync (preference store → toggle visual state). Re-evaluated by
+            // the UI updater system every frame the inspector is visible, so when the
+            // user clicks a different MineTower the toggle automatically updates to
+            // that tower's stored preference. Replaces the old OnActivated override —
+            // we can't override OnActivated on an internal base class.
+            toggle.ObserveValue(() =>
+            {
+                var entity = GetEntityFromInspector(inspector);
+                if (entity == null || DumpPreferenceManager.Instance == null) return false;
+                return DumpPreferenceManager.Instance.IsToggled(entity.Id);
             });
 
             // Create a header label
@@ -837,56 +852,11 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
                 }
             }
 
-            // Store toggle reference for sync
-            var setValueMethod = toggle.GetType().GetMethod("SetValue") ??
-                                 toggle.GetType().GetMethod("set_Value");
-
-            InspectorToggles[inspector] = new ToggleState
-            {
-                Toggle = toggle,
-                SetValueMethod = setValueMethod
-            };
-
             Log.Info("SmartMiningDumpMOD: Toggle panel added to inspector.");
         }
         catch (Exception ex)
         {
             Log.Error($"SmartMiningDumpMOD: AddDumpPreferenceToggle failed: {ex}");
-        }
-    }
-
-    /// <summary>
-    /// Called from the dynamic inspector's OnActivated override.
-    /// Syncs the toggle state to match the currently-inspected MineTower.
-    /// </summary>
-    public static void SyncInspectorToggle(object inspector)
-    {
-        try
-        {
-            if (!InspectorToggles.TryGetValue(inspector, out var toggleState))
-                return;
-
-            var entity = GetEntityFromInspector(inspector);
-            if (entity == null || DumpPreferenceManager.Instance == null)
-                return;
-
-            bool isToggled = DumpPreferenceManager.Instance.IsToggled(entity.Id);
-
-            // Try SetValue(bool) or SetWithoutNotify(bool)
-            if (toggleState.SetValueMethod != null)
-            {
-                toggleState.SetValueMethod.Invoke(toggleState.Toggle, new object[] { isToggled });
-            }
-            else
-            {
-                // Try SetWithoutNotify or similar
-                var setWithout = toggleState.Toggle.GetType().GetMethod("SetWithoutNotify");
-                setWithout?.Invoke(toggleState.Toggle, new object[] { isToggled });
-            }
-        }
-        catch (Exception ex)
-        {
-            Log.Warning($"SmartMiningDumpMOD: SyncInspectorToggle failed: {ex.Message}");
         }
     }
 
@@ -1044,7 +1014,5 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
             }
             catch { }
         }
-
-        InspectorToggles.Clear();
     }
 }

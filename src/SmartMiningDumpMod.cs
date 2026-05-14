@@ -104,6 +104,18 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
     private readonly Dictionary<int, DumpFirstWrapper> m_activeWrappers
         = new Dictionary<int, DumpFirstWrapper>();
 
+    // Set by OnBeforeSave when it unwraps trucks, cleared by OnUpdateAfterSync
+    // after it re-wraps. UpdateAfterSync fires every sync cycle (not just after
+    // a save), so without this flag we'd thrash the providers and spam the log
+    // every ~2 seconds. With the flag we only rewrap when there's actually
+    // something to restore.
+    private bool m_needsRewrapAfterSync;
+
+    // Verbose per-truck diagnostic logging (DUMP ASSIGNED / DUMP FAILED / SKIP
+    // outcomes, WRAPPED line, etc.). Default OFF — useful when troubleshooting
+    // but spammy in normal play. Toggle via the smart_dump_verbose console command.
+    private bool m_verboseLogging;
+
     // ── Diagnostics ─────────────────────────────────────────────────────
     // Towers we've logged a summary for at least once this session. Prevents
     // OnUpdateStart from spamming the log: we summarize each tower only the
@@ -390,6 +402,8 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
                 Log.Warning($"SmartMiningDumpMOD: OnBeforeSave swap-out failed for truck {kv.Key}: {ex.Message}");
             }
         }
+        // Flag for OnUpdateAfterSync: we have wrappers to restore.
+        m_needsRewrapAfterSync = true;
         Log.Info($"SmartMiningDumpMOD: BeforeSave — swapped {unwrappedCount} truck(s) back to vanilla provider.");
         // Note: we do NOT clear m_activeWrappers here. The map still tracks
         // which trucks we WANT wrapped; OnUpdateAfterSync re-installs them.
@@ -402,6 +416,14 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
     /// </summary>
     private void OnUpdateAfterSync()
     {
+        // UpdateAfterSync fires every sync cycle (~30/sec at default speed),
+        // not just after a save — see the ISimLoopEvents doc. We only need to
+        // do work here when OnBeforeSave actually unwrapped something. The
+        // m_needsRewrapAfterSync flag is set by BeforeSave and cleared here,
+        // so most ticks this method is essentially free.
+        if (!m_needsRewrapAfterSync) return;
+        m_needsRewrapAfterSync = false;
+
         if (m_activeWrappers.Count == 0) return;
         int rewrappedCount = 0;
         foreach (var kv in m_activeWrappers)
@@ -410,10 +432,6 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
             {
                 var truck = TryGetTruckById(kv.Key);
                 if (truck == null) continue;
-                // Only rewrap if the truck's current provider is the inner vanilla
-                // one (i.e., what we swapped to in BeforeSave). If something else
-                // changed the provider in between, leave it alone — the reconcile
-                // pass will fix it up.
                 truck.ResetJobProvider();
                 truck.SetJobProvider(kv.Value);
                 rewrappedCount++;
@@ -424,7 +442,7 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
             }
         }
         if (rewrappedCount > 0)
-            Log.Info($"SmartMiningDumpMOD: UpdateAfterSync — rewrapped {rewrappedCount} truck(s).");
+            Log.Info($"SmartMiningDumpMOD: UpdateAfterSync — rewrapped {rewrappedCount} truck(s) after save.");
     }
 
     /// <summary>
@@ -530,7 +548,9 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
             truck.ResetJobProvider();
             truck.SetJobProvider(wrapper);
             m_activeWrappers[truck.Id.Value] = wrapper;
-            RecordOutcome(tower, truck, "WRAPPED with DumpFirstWrapper");
+            // Per-truck WRAPPED line removed — the wrapped=N summary log in
+            // OnTogglePreferenceChanged (and the smart_dump_diag command) is
+            // sufficient. Re-enable via smart_dump_verbose if needed.
         }
         catch (Exception ex)
         {
@@ -659,16 +679,19 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
     }
 
     /// <summary>
-    /// Logs a (tower, truck) outcome only when the outcome string changes from the
-    /// previously-recorded one. This naturally rate-limits — a truck stuck in
-    /// "HasJobs=true" logs once and stays silent until it transitions.
+    /// Per-(tower, truck) outcome logging. Gated behind <see cref="m_verboseLogging"/>
+    /// (default OFF) — useful for troubleshooting but spammy in normal play.
+    /// Toggle on/off via the smart_dump_verbose console command. Even when
+    /// verbose is OFF, we still update the outcome map (cheap) so that flipping
+    /// verbose ON later only logs new transitions, not the full history.
     /// </summary>
     private void RecordOutcome(MineTower tower, Truck truck, string outcome)
     {
         long key = ((long)tower.Id.Value << 32) | (uint)truck.Id.Value;
         if (m_lastAttemptOutcome.TryGetValue(key, out string prev) && prev == outcome) return;
         m_lastAttemptOutcome[key] = outcome;
-        Log.Info($"SmartMiningDumpMOD: Tower {tower.Id} truck {truck.Id}: {outcome}.");
+        if (m_verboseLogging)
+            Log.Info($"SmartMiningDumpMOD: Tower {tower.Id} truck {truck.Id}: {outcome}.");
     }
 
     /// <summary>
@@ -1165,10 +1188,11 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
                 if (entity != null && DumpPreferenceManager.Instance != null)
                 {
                     DumpPreferenceManager.Instance.SetToggle(entity.Id, value);
-                    string state = value ? "ON" : "OFF";
-                    Log.Info($"SmartMiningDumpMOD: Tower {entity.Id} dump preference: {state}");
                     // Apply wrapping immediately so the change takes effect on the
                     // next job request, not on the next ReconcileWrappers tick.
+                    // OnTogglePreferenceChanged logs a single summary line covering
+                    // both the state change AND the wrap/unwrap count — we removed
+                    // the duplicate "dump preference: X" log line that used to be here.
                     SmartMiningDumpMod.Instance?.OnTogglePreferenceChanged(entity, value);
                 }
             });
@@ -1324,6 +1348,26 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
             sb.AppendLine($"  Tower {tower.Id}: [{status}] DumpDesigns={dumpDesigs} DumpProducts={dumpProducts}");
         }
         return sb.ToString();
+    }
+
+    [ConsoleCommand(documentation: "Turns per-truck verbose logging on or off. When ON, each tower↔truck interaction logs its outcome (DUMP ASSIGNED, DUMP FAILED, SKIP reason) on every transition. Default is OFF to keep the log readable in normal play. Usage: smart_dump_verbose on  |  smart_dump_verbose off")]
+    private string SmartDumpVerbose(string state)
+    {
+        if (string.IsNullOrEmpty(state))
+            return $"Verbose logging is currently {(m_verboseLogging ? "ON" : "OFF")}. Usage: smart_dump_verbose on|off";
+
+        string s = state.Trim().ToLowerInvariant();
+        if (s == "on" || s == "true" || s == "1")
+        {
+            m_verboseLogging = true;
+            return "Verbose logging: ON. Per-truck outcomes will now log on every transition.";
+        }
+        if (s == "off" || s == "false" || s == "0")
+        {
+            m_verboseLogging = false;
+            return "Verbose logging: OFF. Only summary lines and errors will log.";
+        }
+        return $"Unrecognized state '{state}'. Use 'on' or 'off'.";
     }
 
     [ConsoleCommand(documentation: "Per-tower-and-truck diagnostic dump for ALL toggled-ON mine towers. Shows IsEnabled, dump designations, DumpableProducts, AssignedInputTowers, and per-assigned-truck state (HasJobs, Cargo, IsEnabled). Run this WHILE trucks are misbehaving so we can see which condition is failing. Usage: smart_dump_diag")]

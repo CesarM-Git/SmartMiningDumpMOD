@@ -208,6 +208,22 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
         CacheReflectionForHotPath();
         SubscribeSimEvents();
         RegisterConsoleCommands();
+
+        // Init-time orphan sweep — catches wrappers that somehow survived a
+        // save/load round trip (e.g., if OnBeforeSave failed silently for some
+        // truck). Without this, those wrappers' Tower reference points at a
+        // deserialized but possibly mismatched MineTower, leaving trucks
+        // permanently "stuck preparing for navigation" even after the player
+        // unassigns them or deletes the tower. The reconcile loop wouldn't
+        // catch these because m_activeWrappers starts the session empty.
+        int orphans = SweepOrphanWrappers("OnInitState");
+        if (orphans > 0)
+        {
+            Log.Warning($"SmartMiningDumpMOD: InitState found {orphans} orphan wrapper(s) from " +
+                $"previous session. Trucks have been restored to vanilla providers; " +
+                $"ReconcileWrappers will re-wrap as appropriate on the next sim tick.");
+        }
+
         Log.Info("SmartMiningDumpMOD: InitState complete. All systems ready.");
     }
 
@@ -456,13 +472,32 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
             Log.Info($"SmartMiningDumpMOD: UpdateAfterSync — rewrapped {rewrappedCount} truck(s) after save.");
     }
 
+    // Counter for throttling the every-Nth-tick orphan sweep. Reset to 0 on init.
+    private int m_reconcileTickCounter;
+
     /// <summary>
     /// Walks every MineTower with toggle-ON and ensures all its assigned trucks
     /// have our DumpFirstWrapper installed. Also unwraps any stale entries
-    /// (truck moved to a non-toggled tower, tower toggled off, truck despawned).
+    /// (truck moved to a non-toggled tower, tower toggled off, truck despawned,
+    /// tower destroyed). Every 300 reconcile ticks (~30 seconds at default sim
+    /// speed), runs an extra orphan sweep that catches wrappers on trucks not
+    /// known to <see cref="m_activeWrappers"/> at all — these would otherwise
+    /// be invisible to the normal Pass 2 cleanup.
     /// </summary>
     private void ReconcileWrappers()
     {
+        // Periodic orphan sweep — catches wrappers that survived save/load,
+        // mod hot-reload artifacts, or any other path we haven't anticipated.
+        // Runs every 300 ticks (~30s) because it's O(all-trucks) but the
+        // failure mode it catches is invisible to the per-tick passes.
+        if (++m_reconcileTickCounter >= 300)
+        {
+            m_reconcileTickCounter = 0;
+            int n = SweepOrphanWrappers("ReconcileWrappers");
+            if (n > 0)
+                Log.Warning($"SmartMiningDumpMOD: Periodic sweep found {n} orphan wrapper(s).");
+        }
+
         // Pass 1: wrap any unwrapped trucks on toggled towers.
         foreach (MineTower tower in m_entitiesManager.GetAllEntitiesOfType<MineTower>())
         {
@@ -491,13 +526,20 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
         }
 
         // Pass 2: unwrap stale entries (truck no longer in any toggled tower's
-        // assigned list, truck despawned, etc.).
+        // assigned list, truck despawned, tower destroyed, etc.).
         if (m_activeWrappers.Count > 0)
         {
             List<int> stale = null;
             foreach (var kv in m_activeWrappers)
             {
                 var tower = kv.Value.Tower;
+                // Destroyed-tower check — even before we look at toggle/assignment,
+                // a dead tower means the wrapper is unusable.
+                if (tower == null || tower.IsDestroyed)
+                {
+                    (stale ?? (stale = new List<int>())).Add(kv.Key);
+                    continue;
+                }
                 bool towerToggled = DumpPreferenceManager.Instance.IsToggled(tower.Id);
                 bool stillAssigned = false;
                 if (towerToggled)
@@ -569,12 +611,19 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
         }
     }
 
-    /// <summary>Removes our wrapper from a truck, restoring the inner vanilla provider.</summary>
+    /// <summary>Removes our wrapper from a truck, restoring the inner vanilla provider
+    /// where safe. If the wrapper's tower has been destroyed, the inner vanilla
+    /// provider's <c>m_mineTower</c> field points at the same dead tower — restoring
+    /// it would just trade one stale provider for another, so we leave
+    /// <c>m_jobProvider = None</c> and additionally cancel any queued jobs (which
+    /// likely target the destroyed tower's designations and would otherwise leave
+    /// the truck stuck "preparing for navigation").</summary>
     private void UnwrapTruck(Truck truck)
     {
         int truckId = truck.Id.Value;
         if (!m_activeWrappers.TryGetValue(truckId, out var wrapper))
             return;
+        bool towerDead = wrapper.Tower == null || wrapper.Tower.IsDestroyed;
         try
         {
             // Only swap-back if the truck's provider is still our wrapper. If
@@ -584,13 +633,22 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
             if (current == wrapper)
             {
                 truck.ResetJobProvider();
-                truck.SetJobProvider(wrapper.InnerProvider);
+                if (!towerDead && wrapper.InnerProvider != null)
+                    truck.SetJobProvider(wrapper.InnerProvider);
+                // else: leave m_jobProvider = None; default provider takes over.
             }
         }
         catch (Exception ex)
         {
             Log.Warning($"SmartMiningDumpMOD: UnwrapTruck failed for truck {truck.Id}: {ex.Message}");
         }
+
+        // When the tower is dead, also clear queued jobs — they were enqueued
+        // by our wrapper against the dead tower's designations and would keep
+        // the truck stuck on doJob() against vanished targets.
+        if (towerDead)
+            TryCancelAllTruckJobs(truck, "unwrap: tower destroyed");
+
         m_activeWrappers.Remove(truckId);
     }
 
@@ -652,6 +710,29 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
         return valueOrNullProp?.GetValue(opt) as IJobProvider<Truck>;
     }
 
+    /// <summary>
+    /// Reflection accessor for the protected <c>PathFindingEntity.Jobs</c>
+    /// property — needed so we can call <c>CancelAll()</c> on the truck's
+    /// queue when its job target (the destroyed tower's designations) is gone.
+    /// </summary>
+    private static readonly PropertyInfo s_pathFindingJobsProp = typeof(Mafi.Core.Entities.Dynamic.PathFindingEntity)
+        .GetProperty("Jobs", BindingFlags.NonPublic | BindingFlags.Instance);
+
+    private static void TryCancelAllTruckJobs(Truck truck, string reason)
+    {
+        try
+        {
+            var jobs = s_pathFindingJobsProp?.GetValue(truck) as Mafi.Core.Vehicles.Jobs.VehicleJobsSequence;
+            if (jobs == null) return;
+            jobs.CancelAll();
+            Log.Info($"SmartMiningDumpMOD: Cancelled queued jobs on truck {truck.Id} ({reason}).");
+        }
+        catch (Exception ex)
+        {
+            Log.Warning($"SmartMiningDumpMOD: TryCancelAllTruckJobs failed for truck {truck.Id}: {ex.Message}");
+        }
+    }
+
     private Truck TryGetTruckById(int truckId)
     {
         // EntitiesManager doesn't expose a clean ById<T> lookup we know of; scan.
@@ -661,6 +742,94 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
             if (truck.Id.Value == truckId) return truck;
         }
         return null;
+    }
+
+    /// <summary>
+    /// Called by <see cref="DumpFirstWrapper.TryGetJobFor"/> when it detects a
+    /// destroyed tower and resets the truck's provider itself. We just drop the
+    /// stale map entry so future reconciles don't trip on it.
+    /// </summary>
+    internal void OnWrapperSelfHealed(Truck truck)
+    {
+        m_activeWrappers.Remove(truck.Id.Value);
+    }
+
+    /// <summary>
+    /// Walks every truck in the world and resets any that have a
+    /// <see cref="DumpFirstWrapper"/> as their <c>m_jobProvider</c>. Run on init
+    /// (after game load) to catch any wrapper that survived a save/load round
+    /// trip — those wrappers hold stale references to the deserialized world
+    /// and can leave trucks "stuck preparing for navigation" because they're
+    /// trying to dump at a tower-context that doesn't quite line up.
+    ///
+    /// This is BELT-AND-BRACES: in the normal happy path, OnBeforeSave swaps
+    /// every wrapper out before serialization, so no orphan should exist. But
+    /// if BeforeSave silently failed for any truck (TryGetTruckById returned
+    /// null, an exception interrupted the loop, etc.), the wrapper persists
+    /// into the save and re-emerges after load. ReconcileWrappers won't see
+    /// it because m_activeWrappers is empty at session start.
+    ///
+    /// After this sweep, <see cref="ReconcileWrappers"/> on the first
+    /// UpdateStart will re-wrap the trucks freshly with correct tower refs.
+    /// </summary>
+    private int SweepOrphanWrappers(string context)
+    {
+        int orphans = 0;
+        try
+        {
+            foreach (var truck in m_entitiesManager.GetAllEntitiesOfType<Truck>())
+            {
+                var current = GetTruckCurrentProvider(truck);
+                if (current is DumpFirstWrapper orphan)
+                {
+                    if (m_activeWrappers.TryGetValue(truck.Id.Value, out var known) && known == orphan)
+                        continue; // legitimate — we know about this one
+
+                    bool towerDead = orphan.Tower == null || orphan.Tower.IsDestroyed;
+                    Log.Warning($"SmartMiningDumpMOD: [{context}] Orphan wrapper on truck {truck.Id} " +
+                        $"(tower={(orphan.Tower != null ? orphan.Tower.Id.ToString() : "null")}, " +
+                        $"towerDestroyed={towerDead}). " +
+                        (towerDead ? "Tower is dead — resetting provider to None (default will take over)."
+                                   : "Restoring inner vanilla provider."));
+                    try
+                    {
+                        truck.ResetJobProvider();
+                        // If the tower the orphan wrapper points to is destroyed, the
+                        // inner MineTowerTruckJobProvider has a m_mineTower pointing at
+                        // the same dead tower — restoring it would just trade one bad
+                        // provider for another. Leave m_jobProvider = None and let the
+                        // truck use m_defaultJobProvider until vanilla re-assigns it
+                        // (or the user manually assigns it to a live tower).
+                        if (!towerDead && orphan.InnerProvider != null)
+                            truck.SetJobProvider(orphan.InnerProvider);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Warning($"SmartMiningDumpMOD: Failed to set provider on orphaned " +
+                            $"truck {truck.Id}, doing bare reset: {ex.Message}");
+                        try { truck.ResetJobProvider(); } catch { }
+                    }
+
+                    // Critical: also cancel any queued jobs that may target the dead
+                    // tower's designations. Without this, the truck stays "preparing
+                    // for navigation" forever because HasJobs=true keeps the wrapper
+                    // (now reset) from ever being consulted again — the truck is
+                    // stuck on a doJob() loop against a vanished target. CancelAll()
+                    // only cancels CANCELLABLE jobs (the safe ones) so unrelated work
+                    // like refuel sequences won't get torn down inappropriately.
+                    if (towerDead)
+                        TryCancelAllTruckJobs(truck, $"orphan-wrapper sweep: tower destroyed");
+
+                    m_activeWrappers.Remove(truck.Id.Value);
+                    orphans++;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"SmartMiningDumpMOD: SweepOrphanWrappers[{context}] failed: {ex.Message}");
+        }
+        return orphans;
     }
 
     private void LogTowerSummary(MineTower tower)
@@ -1370,6 +1539,15 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
         return sb.ToString();
     }
 
+    [ConsoleCommand(documentation: "Scans every truck for an orphan DumpFirstWrapper (a wrapper whose tower is destroyed or that survived a save/load round trip) and resets the truck's provider. Use this to recover trucks that are 'stuck preparing for navigation' after the SmartDump-toggled tower was deleted or unassigned. Reports how many orphans were fixed. Usage: smart_dump_unstick")]
+    private string SmartDumpUnstick()
+    {
+        int orphans = SweepOrphanWrappers("smart_dump_unstick");
+        if (orphans == 0)
+            return "No orphan wrappers found. All trucks have valid job providers.";
+        return $"Found and reset {orphans} orphan wrapper(s). Affected trucks should resume normal behavior within a few ticks.";
+    }
+
     [ConsoleCommand(documentation: "Turns per-truck verbose logging on or off. When ON, each tower↔truck interaction logs its outcome (DUMP ASSIGNED, DUMP FAILED, SKIP reason) on every transition. Default is OFF to keep the log readable in normal play. Usage: smart_dump_verbose on  |  smart_dump_verbose off")]
     private string SmartDumpVerbose(string state)
     {
@@ -1622,6 +1800,31 @@ internal sealed class DumpFirstWrapper : IJobProvider<Truck>
 
     public bool TryGetJobFor(Truck truck)
     {
+        // Self-heal: if the tower this wrapper points to is dead (destroyed by
+        // the player, or this wrapper somehow survived a save/load mismatch),
+        // both we AND our InnerProvider hold stale references — InnerProvider
+        // (the vanilla MineTowerTruckJobProvider) also has a m_mineTower field
+        // pointing to the same dead tower. Calling it would compound the bug.
+        //
+        // Recovery: clear ourselves from the truck's m_jobProvider and let the
+        // truck fall through to m_defaultJobProvider on the next tick. Also
+        // notify the mod so it drops the entry from m_activeWrappers.
+        if (Tower == null || Tower.IsDestroyed)
+        {
+            try
+            {
+                Log.Warning($"SmartMiningDumpMOD: Wrapper on truck {truck.Id} has destroyed/null Tower " +
+                    $"(id={Tower?.Id.ToString() ?? "null"}). Self-healing: resetting truck's provider.");
+                truck.ResetJobProvider();
+                m_mod?.OnWrapperSelfHealed(truck);
+            }
+            catch (Exception ex)
+            {
+                Log.Error($"SmartMiningDumpMOD: Wrapper self-heal failed for truck {truck.Id}: {ex.Message}");
+            }
+            return false;
+        }
+
         // Fast-path checks before the (somewhat-allocating) TryEnqueueDumpJob.
         if (DumpPreferenceManager.Instance != null
             && DumpPreferenceManager.Instance.IsToggled(Tower.Id)

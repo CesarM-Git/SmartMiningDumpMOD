@@ -240,7 +240,12 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
             var towers = m_entitiesManager.GetAllEntitiesOfType<MineTower>().ToList();
             if (towers.Count == 0)
             {
-                Log.Warning("SmartMiningDumpMOD: No MineTowers found. Will retry on first UpdateStart.");
+                // Info, NOT Warning: on a fresh save the player has not built a mining
+                // tower yet, so this is the expected state, not a fault. The retry on
+                // UpdateStart handles it. Logging it as a Warning made a clean start look
+                // like something had gone wrong.
+                Log.Info("SmartMiningDumpMOD: no MineTowers yet (normal on a new save). " +
+                         "DumpJobFactory will resolve once the first tower exists.");
                 return;
             }
 

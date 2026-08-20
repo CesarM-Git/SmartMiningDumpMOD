@@ -4,7 +4,7 @@ A mod for [Captain of Industry](https://www.captain-of-industry.com/) that adds 
 per-tower toggle telling mining trucks to dump waste inside the tower's own zone
 instead of hauling it to storage.
 
-**Version 1.0.2** · Game **0.8.7** · by Nimb
+**Version 1.0.3** · Game **0.8.7** · by Nimb
 
 ## What it does
 

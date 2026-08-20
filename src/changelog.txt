@@ -1,6 +1,16 @@
 Smart Mining Dump — Changelog
 ==============================
 
+v1.0.3
+------
+Fixes:
+- "No MineTowers found" is no longer logged as a Warning on startup. On a new
+  save you have not built a mining tower yet, so this is the normal state, not
+  a fault — the mod already retries once the first tower exists. It now logs
+  at Info and says so.
+
+No gameplay changes. Log wording only.
+
 v1.0.2
 ------
 Fixes:

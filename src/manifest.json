@@ -1,6 +1,6 @@
 {
   "id": "SmartMiningDumpMOD",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "display_name": "Smart Mining Dump",
   "description_short": "Adds a toggle to mining towers so trucks prefer dumping dumpable materials over storing them.",
   "description_long": "When enabled on a mining tower, trucks assigned to that tower will attempt to dump materials marked as dumpable in dumping/leveling designations within the tower's zone before falling back to storage delivery. Toggle via the inspector checkbox or the smart_dump console command.",

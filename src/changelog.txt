@@ -1,6 +1,38 @@
 Smart Mining Dump — Changelog
 ==============================
 
+v1.0.1
+------
+Compatibility:
+- Verified against Captain of Industry 0.8.7. No gameplay changes.
+- The mining tower inspector's constructor changed in 0.8.7: it went from
+  5 parameters to 7 (it now also takes MultiAreaEditController,
+  MineTowersManager and ForestryTowersManager, and the old
+  NewInstanceOf<PolygonAreaSelectionController> parameter is gone). No code
+  change was required — the mod builds its inspector subclass by reading the
+  base constructor's parameter list at runtime rather than hardcoding it, so
+  it adapted to the new signature on its own.
+
+Hardening:
+- The emitted forwarding constructor now boxes value-type parameters before
+  packing them into the argument array. Every mining tower inspector
+  parameter has been a reference type so far, so this is a no-op today, but
+  the constructor has already changed shape once and a struct parameter
+  would previously have produced invalid IL and killed the inspector patch
+  outright.
+- InspectorsManager now auto-discovers IEntityInspector<T> implementations in
+  its own constructor instead of starting empty. This happens before the
+  mod's init-state callback, so the dictionary swap still works unchanged.
+- Every other game API this mod reaches by reflection was re-checked and
+  none of them moved or changed shape: MineTower.m_trucksJobProvider,
+  TruckJobProviderBase.Context, TruckJobProviderContext.DumpJobFactory,
+  DumpingJob.Factory.TryCreateAndEnqueueJob (5-argument overload),
+  Truck.m_jobProvider / DeactivateCannotDeliver,
+  PathFindingEntity.Jobs, InspectorsManager.m_inspectorsImplTypes, and
+  BaseInspector.AddPanelRow / Entity.
+- min_game_version is now 0.8.7. This build no longer claims support for
+  older game versions as it wasn't verified for them.
+
 v1.0.0
 ------
 Initial release.

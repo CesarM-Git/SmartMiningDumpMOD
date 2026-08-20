@@ -117,7 +117,8 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
     private bool m_verboseLogging;
 
     // Idempotency guard for console-command registration. The COI IMod
-    // lifecycle in 0.8.4b re-fires OnInitState at least once after the first
+    // lifecycle (observed in 0.8.4b, still the case through 0.8.7) re-fires
+    // OnInitState at least once after the first
     // pass (deferred init-state phase / scene re-entry), and the second call
     // to executor.ScanObjectForConsoleCommands logs
     //   E ... Multiple commands with the same name: smart_dump_*
@@ -1264,9 +1265,19 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
                 ctorIl.Emit(OpCodes.Dup);
                 ctorIl.Emit(OpCodes.Ldc_I4, i);
                 ctorIl.Emit(OpCodes.Ldarg_S, (byte)(i + 1));
-                // All ctor params are reference types (UiContext, TowerAreasRenderer,
-                // AssignedBuildingsHighlighter, BuildingsAssigner,
-                // NewInstanceOf<PolygonAreaSelectionController>) — no Box needed.
+                // As of 0.8.7 the vanilla MineTowerInspector ctor takes 7 parameters
+                // (UiContext, TowerAreasRenderer, AssignedBuildingsHighlighter,
+                // BuildingsAssigner, MultiAreaEditController, MineTowersManager,
+                // ForestryTowersManager) and every one of them is a reference type, so
+                // in practice no Box is emitted. We do NOT rely on that: the parameter
+                // list is read from the base ctor at runtime, and the game has already
+                // changed it once (it was 5 parameters in 0.8.4b, ending in
+                // NewInstanceOf<PolygonAreaSelectionController>). Boxing value types
+                // here keeps the emitted ctor correct if a future version introduces a
+                // struct parameter — without it, Stelem_Ref on an unboxed value type
+                // produces invalid IL and the inspector patch dies at type-bake time.
+                if (paramTypes[i].IsValueType)
+                    ctorIl.Emit(OpCodes.Box, paramTypes[i]);
                 ctorIl.Emit(OpCodes.Stelem_Ref);
             }
             ctorIl.Emit(OpCodes.Call, invokeBaseCtorMethod);
@@ -1474,7 +1485,7 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
 
     private void RegisterConsoleCommands()
     {
-        // Idempotency guard: OnInitState fires more than once in the 0.8.4b
+        // Idempotency guard: OnInitState fires more than once in the 0.8.4b–0.8.7
         // IMod lifecycle (deferred init-state pass), and ignoreDuplicates: true
         // does NOT suppress the executor's "Multiple commands with the same
         // name: <name>" error log on the repeat call.  The flag avoids the

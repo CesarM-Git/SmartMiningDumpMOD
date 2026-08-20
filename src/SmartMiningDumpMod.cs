@@ -116,16 +116,11 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
     // but spammy in normal play. Toggle via the smart_dump_verbose console command.
     private bool m_verboseLogging;
 
-    // Idempotency guard for console-command registration. The COI IMod
-    // lifecycle (observed in 0.8.4b, still the case through 0.8.7) re-fires
-    // OnInitState at least once after the first
-    // pass (deferred init-state phase / scene re-entry), and the second call
-    // to executor.ScanObjectForConsoleCommands logs
-    //   E ... Multiple commands with the same name: smart_dump_*
-    // for every command even when ignoreDuplicates: true is passed.  No
-    // actual double-registration happens (the executor still skips the
-    // duplicates internally), but the error spam confuses real diagnostics.
-    // See .claude/modding-patterns.md "Make the registration idempotent".
+    // Guards the one-time RegisterRendererInitState subscription used to verify
+    // that the game's own console scan picked up this mod's commands.
+    // This mod does NOT register its own console commands — see
+    // VerifyConsoleCommandsRegistered for why, and for the corrected diagnosis
+    // of the "Multiple commands with the same name" error.
     private bool m_consoleCommandsRegistered;
 
     // ── Diagnostics ─────────────────────────────────────────────────────
@@ -208,7 +203,7 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
         ResolveDumpJobFactory();
         CacheReflectionForHotPath();
         SubscribeSimEvents();
-        RegisterConsoleCommands();
+        VerifyConsoleCommandsRegistered();
 
         // Init-time orphan sweep — catches wrappers that somehow survived a
         // save/load round trip (e.g., if OnBeforeSave failed silently for some
@@ -1483,26 +1478,88 @@ public sealed class SmartMiningDumpMod : IMod, IDisposable
     // Console commands
     // ═══════════════════════════════════════════════════════════════════
 
-    private void RegisterConsoleCommands()
+    /// <summary>
+    /// DO NOT self-register console commands. The game does it for us.
+    ///
+    /// <c>GameConsoleCommandsExecutor</c>'s constructor registers
+    /// <c>scanAllConsoleCommands</c> on <c>RegisterRendererInitState</c>. That method walks
+    /// <c>DependencyResolver.AllResolvedInstances</c> — which includes every <see cref="IMod"/>
+    /// instance — and calls <c>ScanObjectForConsoleCommands(instance)</c> with
+    /// <c>ignoreDuplicates</c> left at its default of <b>false</b>.
+    ///
+    /// So if the mod also registers its own commands in InitState, the game's later scan finds
+    /// them already present and logs one Error per command — six of them for this mod:
+    ///   E ... Multiple commands with the same name: smart_dump
+    ///   E ... Multiple commands with the same name: smart_dump_all
+    ///   ... etc.
+    /// The commands still work — <c>GameCommandsExecutor.RegisterCommand</c> logs and returns
+    /// without overwriting, so the mod's earlier registration survives — but the errors are
+    /// indistinguishable from a real fault when reading a log.
+    ///
+    /// This is NOT the mod's InitState firing twice. That was the previous (wrong) diagnosis,
+    /// and the <c>m_consoleCommandsRegistered</c> guard it produced could never have helped:
+    /// the duplicate comes from the game, not from us. The 0.8.7 log shows
+    /// "Registered 6 console command(s)" exactly once, followed by the game's scan erroring
+    /// six times.
+    ///
+    /// Rather than register and then apologise, we register nothing and simply verify that the
+    /// game's scan picked us up. Ordering is guaranteed: the executor subscribes to
+    /// RendererInitState in its constructor (during InstantiateAllAndLock), we subscribe later
+    /// from InitState, and these events fire in registration order — so the game's scan has
+    /// always run by the time our check does.
+    ///
+    /// The fallback exists because a previous attempt at "just delete the registration" ended
+    /// with the commands missing entirely. If that ever recurs, this self-heals and says so in
+    /// the log instead of failing silently.
+    /// </summary>
+    private void VerifyConsoleCommandsRegistered()
     {
-        // Idempotency guard: OnInitState fires more than once in the 0.8.4b–0.8.7
-        // IMod lifecycle (deferred init-state pass), and ignoreDuplicates: true
-        // does NOT suppress the executor's "Multiple commands with the same
-        // name: <name>" error log on the repeat call.  The flag avoids the
-        // spam without changing registration behaviour.
-        if (m_consoleCommandsRegistered) {
-            return;
-        }
+        if (m_consoleCommandsRegistered) return;
+        m_consoleCommandsRegistered = true;
+
         try
         {
-            var executor = m_resolver.Resolve<GameConsoleCommandsExecutor>();
-            int count = executor.ScanObjectForConsoleCommands(this, ignoreDuplicates: true);
-            m_consoleCommandsRegistered = true;
-            Log.Info($"SmartMiningDumpMOD: Registered {count} console command(s).");
+            m_gameLoopEvents.RegisterRendererInitState(this, CheckConsoleCommandsAfterGameScan);
         }
         catch (Exception ex)
         {
-            Log.Error($"SmartMiningDumpMOD: Failed to register console commands: {ex.Message}");
+            Log.Error($"SmartMiningDumpMOD: Failed to schedule console-command verification: {ex.Message}");
+        }
+    }
+
+    private void CheckConsoleCommandsAfterGameScan()
+    {
+        try
+        {
+            int expected = GetType()
+                .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                .Count(m => m.GetCustomAttribute<ConsoleCommandAttribute>() != null);
+
+            var executor = m_resolver.Resolve<GameConsoleCommandsExecutor>();
+
+            // Each command is registered under two keys (snake_case and squashed), both
+            // pointing at the same GameCommand, so count distinct methods rather than entries.
+            var mine = new HashSet<MethodInfo>();
+            foreach (var command in executor.Executor.Commands.Values)
+            {
+                if (ReferenceEquals(command.Target, this))
+                    mine.Add(command.Method);
+            }
+
+            if (mine.Count >= expected)
+            {
+                Log.Info($"SmartMiningDumpMOD: {mine.Count}/{expected} console command(s) registered by the game's scan.");
+                return;
+            }
+
+            Log.Warning($"SmartMiningDumpMOD: the game's console scan registered only {mine.Count}/{expected} " +
+                        "of this mod's commands. Self-registering the remainder.");
+            int count = executor.ScanObjectForConsoleCommands(this, ignoreDuplicates: true);
+            Log.Info($"SmartMiningDumpMOD: self-registered {count} console command(s) as a fallback.");
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"SmartMiningDumpMOD: Console-command verification failed: {ex.Message}");
         }
     }
 

@@ -1,6 +1,24 @@
 Smart Mining Dump — Changelog
 ==============================
 
+v1.0.2
+------
+Fixes:
+- Removed six "Multiple commands with the same name" errors from the game
+  log on every load — one each for smart_dump, smart_dump_all,
+  smart_dump_status, smart_dump_unstick, smart_dump_verbose and
+  smart_dump_diag. The mod was registering its own console commands, and
+  the game then registered them again during its own startup scan, which
+  logs an Error-severity line with a stack trace per command. The commands
+  always worked — the game's registration bails out without overwriting —
+  but six errors looked like a real fault.
+- The mod no longer registers its commands itself. The game discovers
+  [ConsoleCommand] methods on mods automatically. The mod now only verifies
+  after the game's scan that all six are present, and self-registers
+  quietly if any are missing.
+
+No gameplay changes. All six commands behave exactly as before.
+
 v1.0.1
 ------
 Compatibility:
